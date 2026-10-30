@@ -7,14 +7,15 @@ declare(strict_types=1);
  * Analysiert fileadmin/_migrated/* einer TYPO3-Installation (v12/v13):
  *  - Welche Dateien gibt es (Dateisystem + sys_file)?
  *  - Wo sind sie eingebunden (sys_file_reference, sys_refindex, Textfelder, Code)?
- *  - Auf welchen Seiten / Sites / Domains?
- *  - Wer hat die einbindenden Datensätze angelegt/geändert (sys_history, sys_log)?
- *  - Werden sie noch direkt abgerufen (Webserver-Access-Logs)?
- *  - Können sie gelöscht werden?
+ *  - Auf welchen Seiten / Sites / Domains – auch versteckte und gelöschte (Papierkorb)?
+ *  - Werden sie noch direkt abgerufen (Webserver-Access-Logs), von welcher Domain,
+ *    und stammt der Link (Referer) von einer TYPO3-Seite?
+ *  - Können sie gelöscht werden? (nur wenn weder TYPO3 noch das Log eine Verwendung zeigt)
  *
  * Das Skript arbeitet ausschließlich lesend.
  */
 
+use Typo3Tools\AccessLog;
 use Typo3Tools\Db;
 use Typo3Tools\Typo3Env;
 
@@ -87,15 +88,41 @@ try {
 final class MigratedAnalyzer
 {
     private const STATUS_IN_USE = 'IN_VERWENDUNG';
+    private const STATUS_HIDDEN = 'VERSTECKT_VERWENDET';
+    private const STATUS_TRASH = 'IM_PAPIERKORB';
+    private const STATUS_REQUESTED = 'ABGERUFEN_OHNE_REFERENZ';
     private const STATUS_REVIEW = 'PRUEFEN';
-    private const STATUS_DELETED_ONLY = 'NUR_GELOESCHTE_REFERENZEN';
     private const STATUS_UNUSED = 'UNBENUTZT';
 
+    /** Reihenfolge = Priorität */
+    private const STATUSES = [
+        self::STATUS_IN_USE, self::STATUS_HIDDEN, self::STATUS_TRASH, self::STATUS_REQUESTED, self::STATUS_REVIEW, self::STATUS_UNUSED,
+    ];
+
     private const RECOMMENDATION = [
-        self::STATUS_IN_USE => 'Behalten. Bei Bedarf über die TYPO3-Dateiliste verschieben/umbenennen (Referenzen bleiben erhalten).',
-        self::STATUS_REVIEW => 'Manuell prüfen (siehe Begründung und verwendungen.csv).',
-        self::STATUS_DELETED_ONLY => 'Löschbar, sofern die gelöschten Datensätze nicht mehr aus dem Papierkorb wiederhergestellt werden sollen.',
-        self::STATUS_UNUSED => 'Löschkandidat – zuerst in Quarantäne verschieben (bin/migrated-quarantine.php).',
+        self::STATUS_IN_USE => 'Behalten – öffentlich eingebunden.',
+        self::STATUS_HIDDEN => 'Behalten – eingebunden in versteckten/zeitgesteuerten Inhalten, Ordnern oder Workspaces.',
+        self::STATUS_TRASH => 'Behalten – nur noch in gelöschten Inhalten (Papierkorb), wiederherstellbar.',
+        self::STATUS_REQUESTED => 'Behalten – keine Referenz in TYPO3, wird aber laut Access-Log noch aufgerufen (Links müssen funktionieren).',
+        self::STATUS_REVIEW => 'Manuell prüfen (siehe Begründung).',
+        self::STATUS_UNUSED => 'Löschkandidat – zuerst in Quarantäne verschieben und Log beobachten (bin/migrated-quarantine.php).',
+    ];
+
+    /** Verwendungs-Status => Datei-Status */
+    private const USAGE_TO_FILE_STATUS = [
+        'aktiv' => self::STATUS_IN_USE,
+        'versteckt' => self::STATUS_HIDDEN,
+        'workspace' => self::STATUS_HIDDEN,
+        'sysordner' => self::STATUS_HIDDEN,
+        'ausserhalb_site' => self::STATUS_HIDDEN,
+        'papierkorb' => self::STATUS_TRASH,
+        'unbekannt' => self::STATUS_REVIEW,
+        'verwaist' => self::STATUS_UNUSED,
+    ];
+
+    private const USAGE_LABEL = [
+        'aktiv' => 'aktiv', 'versteckt' => 'versteckt', 'workspace' => 'Workspace', 'sysordner' => 'Ordner',
+        'ausserhalb_site' => 'ohne Site', 'papierkorb' => 'Papierkorb', 'unbekannt' => 'unbekannt', 'verwaist' => 'verwaist',
     ];
 
     /** Tabellen, die bei der Volltextsuche übersprungen werden (Präfix-Vergleich) */
@@ -114,8 +141,6 @@ final class MigratedAnalyzer
     ];
     private const FS_SCAN_SKIP_DIRS = ['vendor', 'node_modules', '.git', '.svn', '_processed_', '_migrated', '_temp_', 'typo3temp'];
 
-    private const BOT_PATTERN = '/bot|crawl|spider|slurp|preview|facebookexternalhit|curl|wget|python|java\/|monitor|uptime|scan/i';
-
     private int $now;
     private int $storage = 1;
     /** @var string[] */
@@ -131,6 +156,12 @@ final class MigratedAnalyzer
     private array $pages = [];
     /** @var array<int, array> */
     private array $sites = [];
+    /** @var array<string, int> Host => rootPageId */
+    private array $hostToSite = [];
+    /** @var array<int, array<int, array>> l10n_parent => [Sprache => Seitenzeile] */
+    private array $translations = [];
+    /** @var array<int, array<int, array<string, int>>> rootPageId => Sprache => Slug => Seiten-UID */
+    private array $slugMap = [];
     /** @var array<int, string> */
     private array $users = [];
     private array $recordCache = [];
@@ -144,7 +175,7 @@ final class MigratedAnalyzer
     private array $logMissing = [];
     /** @var string[] */
     private array $warnings = [];
-    private array $logStats = ['files' => 0, 'lines' => 0, 'from' => null, 'to' => null];
+    private ?AccessLog $accessLog = null;
 
     public function __construct(
         private readonly Typo3Env $env,
@@ -172,6 +203,11 @@ final class MigratedAnalyzer
     {
         $this->step('Lade Seitenbaum, Sites und Backend-Benutzer');
         $this->sites = $this->env->sites();
+        foreach ($this->sites as $root => $site) {
+            foreach ($site['hosts'] as $host) {
+                $this->hostToSite[$host] = $root;
+            }
+        }
         $this->loadPages();
         $this->loadUsers();
         $this->checkRefindex();
@@ -206,7 +242,7 @@ final class MigratedAnalyzer
             $this->collectAccessLogs();
         }
 
-        $this->step('Ordne Seiten, Sites und Bearbeiter zu, klassifiziere');
+        $this->step('Ordne Seiten, Sites und Domains zu, klassifiziere');
         $this->classify();
 
         $this->step("Schreibe Bericht nach $outDir");
@@ -240,6 +276,10 @@ final class MigratedAnalyzer
         $cols = array_values(array_filter($wanted, fn ($c) => $this->db->has('pages', $c)));
         foreach ($this->db->all('SELECT ' . implode(',', array_map([Db::class, 'q'], $cols)) . ' FROM pages') as $row) {
             $this->pages[(int)$row['uid']] = $row;
+            if ((int)($row['sys_language_uid'] ?? 0) > 0 && !empty($row['l10n_parent'])
+                && empty($row['deleted']) && (int)($row['t3ver_wsid'] ?? 0) === 0) {
+                $this->translations[(int)$row['l10n_parent']][(int)$row['sys_language_uid']] = $row;
+            }
         }
     }
 
@@ -320,7 +360,7 @@ final class MigratedAnalyzer
             'duplicates' => [],
             'usages' => [],
             'file_log' => [],
-            'log' => ['hits' => 0, 'bots' => 0, 'last' => null, 'referers' => []],
+            'log' => ['hits' => 0, 'bots' => 0, 'last' => null, 'domains' => [], 'intern' => [], 'extern' => [], 'intern_pages' => []],
             'status' => '',
             'reason' => '',
         ];
@@ -693,74 +733,98 @@ final class MigratedAnalyzer
 
     private function collectAccessLogs(): void
     {
-        $logFiles = [];
-        foreach ($this->accessLogs as $pattern) {
-            foreach (glob($pattern) ?: [] as $f) {
-                if (is_file($f)) {
-                    $logFiles[$f] = true;
+        $this->accessLog = new AccessLog($this->accessLogs);
+        $this->buildSlugMap();
+        foreach ($this->accessLog->entries('/fileadmin/_migrated/') as $e) {
+            $identifier = substr($e['path'], strpos($e['path'], '/fileadmin/_migrated/') + strlen('/fileadmin'));
+            if (!isset($this->files[$identifier])) {
+                $folder = explode('/', $identifier)[2] ?? '';
+                if (in_array($folder, $this->folders, true)) {
+                    $this->logMissing[$identifier] = ($this->logMissing[$identifier] ?? 0) + 1;
                 }
-            }
-        }
-        if ($logFiles === []) {
-            $this->warnings[] = 'Keine Access-Logs gefunden für: ' . implode(', ', $this->accessLogs);
-            return;
-        }
-        foreach (array_keys($logFiles) as $logFile) {
-            $h = @gzopen($logFile, 'rb'); // liest auch unkomprimierte Dateien
-            if ($h === false) {
-                $this->warnings[] = "Log nicht lesbar (Rechte?): $logFile";
                 continue;
             }
-            $this->logStats['files']++;
-            while (($line = gzgets($h)) !== false) {
-                $this->logStats['lines']++;
-                if (!str_contains($line, '/fileadmin/')) {
-                    continue;
-                }
-                if (!preg_match('~\[([^\]]+)\] "([A-Z]+) (\S+)[^"]*" (\d{3}) \S+(?: "([^"]*)" "([^"]*)")?~', $line, $m)) {
-                    continue;
-                }
-                $ts = \DateTime::createFromFormat('d/M/Y:H:i:s O', $m[1]);
-                $ts = $ts ? $ts->getTimestamp() : null;
-                if ($ts !== null) {
-                    $this->logStats['from'] = min($this->logStats['from'] ?? $ts, $ts);
-                    $this->logStats['to'] = max($this->logStats['to'] ?? $ts, $ts);
-                }
-                $path = (string)parse_url($m[3], PHP_URL_PATH);
-                $pos = strpos($path, '/fileadmin/_migrated/');
-                if ($pos === false) {
-                    continue;
-                }
-                $identifier = rawurldecode(substr($path, $pos + strlen('/fileadmin')));
-                $status = (int)$m[4];
-                if (!isset($this->files[$identifier])) {
-                    $folder = explode('/', $identifier)[2] ?? '';
-                    if (in_array($folder, $this->folders, true)) {
-                        $this->logMissing[$identifier] = ($this->logMissing[$identifier] ?? 0) + 1;
-                    }
-                    continue;
-                }
-                if (!in_array($status, [200, 206, 304], true)) {
-                    continue;
-                }
-                $log = &$this->files[$identifier]['log'];
-                if (preg_match(self::BOT_PATTERN, $m[6] ?? '')) {
-                    $log['bots']++;
-                } else {
-                    $log['hits']++;
-                    $referer = $m[5] ?? '-';
-                    if ($referer !== '' && $referer !== '-') {
-                        $host = parse_url($referer, PHP_URL_HOST) ?: $referer;
-                        $log['referers'][$host] = ($log['referers'][$host] ?? 0) + 1;
-                    }
-                }
-                if ($ts !== null && ($log['last'] === null || $ts > $log['last'])) {
-                    $log['last'] = $ts;
-                }
-                unset($log);
+            if (!in_array($e['status'], [200, 206, 304], true)) {
+                continue;
             }
-            gzclose($h);
+            $log = &$this->files[$identifier]['log'];
+            $ref = $e['referer'] !== '' ? $this->classifyReferer($e['referer']) : null;
+            // Domain, unter der die Datei abgerufen wurde: vhost/Logdateiname, sonst Host eines internen Referers
+            $domain = $e['host'] !== '' ? $e['host'] : ($ref !== null && $ref['internal'] ? $ref['host'] : '');
+            if ($domain !== '') {
+                $log['domains'][$domain] = ($log['domains'][$domain] ?? 0) + 1;
+            }
+            if ($e['bot']) {
+                $log['bots']++;
+            } else {
+                $log['hits']++;
+                if ($ref !== null) {
+                    $bucket = $ref['internal'] ? 'intern' : 'extern';
+                    $log[$bucket][$ref['label']] = ($log[$bucket][$ref['label']] ?? 0) + 1;
+                    if ($ref['page'] !== null) {
+                        $log['intern_pages'][$ref['page']] = true;
+                    }
+                }
+            }
+            if ($e['ts'] !== null && ($log['last'] === null || $e['ts'] > $log['last'])) {
+                $log['last'] = $e['ts'];
+            }
+            unset($log);
         }
+        array_push($this->warnings, ...$this->accessLog->warnings);
+    }
+
+    /** Slug-Index je Site und Sprache, um Referer-URLs TYPO3-Seiten zuzuordnen */
+    private function buildSlugMap(): void
+    {
+        foreach ($this->pages as $uid => $p) {
+            if (!empty($p['deleted']) || (int)($p['t3ver_wsid'] ?? 0) > 0 || !isset($p['slug'])) {
+                continue;
+            }
+            $lang = (int)($p['sys_language_uid'] ?? 0);
+            $defaultUid = $lang > 0 && !empty($p['l10n_parent']) ? (int)$p['l10n_parent'] : $uid;
+            $info = $this->pageInfo($defaultUid);
+            if ($info['root'] > 0) {
+                $this->slugMap[$info['root']][$lang][rtrim((string)$p['slug'], '/') ?: '/'] = $defaultUid;
+            }
+        }
+    }
+
+    /**
+     * Ordnet einen Referer einer Site und (wenn möglich) einer TYPO3-Seite zu.
+     * @return array{internal:bool, host:string, page:?int, label:string}
+     */
+    private function classifyReferer(string $referer): array
+    {
+        $host = Typo3Env::host($referer);
+        if ($host === '' || !isset($this->hostToSite[$host])) {
+            return ['internal' => false, 'host' => $host, 'page' => null, 'label' => $host !== '' ? $host : $referer];
+        }
+        $root = $this->hostToSite[$host];
+        $path = rawurldecode((string)(parse_url($referer, PHP_URL_PATH) ?? '/'));
+        // passende Sprache = längstes Basis-Pfad-Präfix auf diesem Host
+        $languages = $this->sites[$root]['languages'] ?: [0 => $this->sites[$root]['base']];
+        $bestLang = 0;
+        $bestPrefix = '';
+        foreach ($languages as $lang => $base) {
+            if (Typo3Env::host($base) !== '' && Typo3Env::host($base) !== $host) {
+                continue;
+            }
+            $prefix = rtrim((string)(parse_url($base, PHP_URL_PATH) ?? ''), '/');
+            if (($path === $prefix || str_starts_with($path, $prefix . '/')) && strlen($prefix) >= strlen($bestPrefix)) {
+                $bestLang = (int)$lang;
+                $bestPrefix = $prefix;
+            }
+        }
+        $slug = rtrim(substr($path, strlen($bestPrefix)), '/') ?: '/';
+        $page = $this->slugMap[$root][$bestLang][$slug]
+            ?? $this->slugMap[$root][$bestLang][preg_replace('/\.html?$/', '', $slug)]
+            ?? null;
+        if ($page === null && preg_match('/(?:^|&)id=(\d+)/', (string)parse_url($referer, PHP_URL_QUERY), $m) && isset($this->pages[(int)$m[1]])) {
+            $page = (int)$m[1];
+        }
+        $label = $host . $path . ' → ' . ($page !== null ? "Seite $page \"" . $this->pages[$page]['title'] . '"' : 'keine TYPO3-Seite gefunden');
+        return ['internal' => true, 'host' => $host, 'page' => $page, 'label' => $label];
     }
 
     // ------------------------------------------------------------------
@@ -824,7 +888,7 @@ final class MigratedAnalyzer
             return $this->pageCache[$pageUid];
         }
         $info = ['exists' => isset($this->pages[$pageUid]), 'deleted' => false, 'hidden' => false, 'doktype' => 0,
-            'title' => '', 'path' => '', 'site' => '', 'base' => '', 'url' => '', 'in_site' => false];
+            'orphan' => false, 'title' => '', 'path' => '', 'site' => '', 'root' => 0, 'in_site' => false, 'slug' => ''];
         if (!$info['exists']) {
             return $this->pageCache[$pageUid] = $info;
         }
@@ -838,7 +902,8 @@ final class MigratedAnalyzer
         $page = $chain[0];
         $info['title'] = (string)$page['title'];
         $info['doktype'] = (int)($page['doktype'] ?? 1);
-        $info['deleted'] = $u > 0; // Elternseite fehlt => verwaister Teilbaum
+        $info['slug'] = (string)($page['slug'] ?? '');
+        $info['orphan'] = $u > 0; // Elternseite fehlt => verwaister Teilbaum
         foreach ($chain as $i => $p) {
             if (!empty($p['deleted'])) {
                 $info['deleted'] = true;
@@ -856,7 +921,7 @@ final class MigratedAnalyzer
                 $site = $this->sites[(int)$p['uid']];
                 $info['in_site'] = true;
                 $info['site'] = $site['identifier'];
-                $info['base'] = $site['base'];
+                $info['root'] = (int)$p['uid'];
                 break;
             }
         }
@@ -868,11 +933,39 @@ final class MigratedAnalyzer
                 }
             }
         }
-        if ($info['in_site'] && in_array($info['doktype'], [1, 3, 4, 7], true)) {
-            $base = rtrim($info['base'], '/');
-            $info['url'] = !empty($page['slug']) ? $base . $page['slug'] : $base . '/?id=' . $pageUid;
-        }
         return $this->pageCache[$pageUid] = $info;
+    }
+
+    /** Basis-URL einer Site für eine Sprache (Sprache -1 = alle => Standardsprache) */
+    private function languageBase(int $root, int $lang): string
+    {
+        $site = $this->sites[$root] ?? null;
+        if ($site === null) {
+            return '';
+        }
+        return $site['languages'][max(0, $lang)] ?? $site['languages'][0] ?? $site['base'];
+    }
+
+    /** Domain, unter der eine Seite in einer Sprache erreichbar ist */
+    private function domainFor(array $page, int $lang): string
+    {
+        if ($page['root'] === 0) {
+            return $page['site'] !== '' ? $page['site'] : '(keine Site)';
+        }
+        $host = Typo3Env::host($this->languageBase($page['root'], $lang));
+        return $host !== '' ? $host : $page['site'];
+    }
+
+    private function urlFor(int $pageUid, array $page, int $lang): string
+    {
+        if ($page['root'] === 0 || !in_array($page['doktype'], [1, 3, 4, 7], true)) {
+            return '';
+        }
+        $slug = $lang > 0 && isset($this->translations[$pageUid][$lang]['slug'])
+            ? (string)$this->translations[$pageUid][$lang]['slug']
+            : $page['slug'];
+        $base = rtrim($this->languageBase($page['root'], $lang), '/');
+        return $slug !== '' ? $base . $slug : $base . '/?id=' . $pageUid;
     }
 
     /** Wer hat einen Datensatz angelegt / zuletzt geändert (sys_history + sys_log) */
@@ -913,22 +1006,25 @@ final class MigratedAnalyzer
         if ($u['uid'] === null) {
             return ['unbekannt', 'Fundstelle ohne Datensatz-UID'];
         }
-        if ($u['ref_deleted']) {
-            return ['geloescht', 'Dateireferenz gelöscht'];
-        }
         $rec = $this->resolveRecord($u['table'], $u['uid']);
         if (!$rec['exists']) {
-            return ['geloescht', $rec['reason']];
+            return ['verwaist', $rec['reason']];
+        }
+        $page = $rec['page'] > 0 ? $this->pageInfo($rec['page']) : null;
+        if ($page !== null && (!$page['exists'] || $page['orphan'])) {
+            return ['verwaist', 'Seite existiert nicht mehr (verwaister Datensatz)'];
+        }
+        if ($u['ref_deleted']) {
+            return ['papierkorb', 'Dateireferenz gelöscht (Papierkorb)'];
         }
         if ($rec['deleted']) {
-            return ['geloescht', 'Datensatz gelöscht (Papierkorb)'];
+            return ['papierkorb', 'Datensatz gelöscht (Papierkorb)'];
+        }
+        if ($page !== null && $page['deleted']) {
+            return ['papierkorb', 'Seite (oder übergeordnete Seite) gelöscht (Papierkorb)'];
         }
         if ($u['ref_ws'] > 0 || $rec['ws'] > 0) {
             return ['workspace', 'Nur in einer Workspace-Version'];
-        }
-        $page = $rec['page'] > 0 ? $this->pageInfo($rec['page']) : null;
-        if ($page !== null && (!$page['exists'] || $page['deleted'])) {
-            return ['geloescht', 'Seite gelöscht oder verwaist'];
         }
         if ($u['ref_hidden']) {
             return ['versteckt', 'Dateireferenz versteckt'];
@@ -960,47 +1056,56 @@ final class MigratedAnalyzer
                 $folderReferenced[$parts[1] ?? ''] = true;
             }
         }
+        $priority = array_flip(self::STATUSES);
         foreach ($this->files as &$entry) {
-            $counts = ['aktiv' => 0, 'pruefen' => 0, 'geloescht' => 0, 'text' => 0];
+            $counts = array_fill_keys(array_keys(self::USAGE_LABEL), 0) + ['text' => 0];
+            $status = self::STATUS_UNUSED;
             foreach ($entry['usages'] as &$u) {
                 [$u['status'], $u['status_reason']] = $this->usageStatus($u);
-                $bucket = match ($u['status']) {
-                    'aktiv' => 'aktiv',
-                    'geloescht' => 'geloescht',
-                    default => 'pruefen',
-                };
-                $counts[$bucket]++;
+                $counts[$u['status']]++;
                 if (isset($u['sources']['textfeld']) || isset($u['sources']['dateisystem'])) {
                     $counts['text']++;
+                }
+                $candidate = self::USAGE_TO_FILE_STATUS[$u['status']];
+                if ($priority[$candidate] < $priority[$status]) {
+                    $status = $candidate;
                 }
             }
             unset($u);
             $entry['counts'] = $counts;
 
             $reasons = [];
-            if ($counts['aktiv'] > 0) {
-                $status = self::STATUS_IN_USE;
-                $reasons[] = $counts['aktiv'] . ' aktive Verwendung(en)';
-            } elseif ($counts['pruefen'] > 0) {
-                $status = self::STATUS_REVIEW;
-                $kinds = array_unique(array_map(static fn ($u) => $u['status_reason'], array_filter($entry['usages'], static fn ($u) => !in_array($u['status'], ['aktiv', 'geloescht'], true))));
-                $reasons[] = 'Nur nicht öffentliche Verwendungen: ' . implode('; ', $kinds);
-            } elseif ($counts['geloescht'] > 0) {
-                $status = self::STATUS_DELETED_ONLY;
-                $reasons[] = $counts['geloescht'] . ' Verwendung(en) nur in gelöschten Datensätzen/Seiten';
-            } else {
-                $status = self::STATUS_UNUSED;
-                $reasons[] = 'Keine Verwendung gefunden';
-            }
-            if (in_array($status, [self::STATUS_UNUSED, self::STATUS_DELETED_ONLY], true)) {
-                if ($entry['log']['hits'] > 0) {
-                    $status = self::STATUS_REVIEW;
-                    $reasons[] = 'wird laut Access-Log noch direkt abgerufen (' . $entry['log']['hits'] . 'x, z. B. externe Links)';
+            foreach ($counts as $usageStatus => $n) {
+                if ($n > 0 && $usageStatus !== 'text') {
+                    $reasons[] = $n . 'x ' . self::USAGE_LABEL[$usageStatus];
                 }
-                if (isset($folderReferenced[$entry['folder']])) {
+            }
+            if ($status === self::STATUS_HIDDEN || $status === self::STATUS_REVIEW) {
+                $kinds = array_unique(array_map(static fn ($u) => $u['status_reason'],
+                    array_filter($entry['usages'], static fn ($u) => self::USAGE_TO_FILE_STATUS[$u['status']] === $status)));
+                $reasons[] = implode('; ', $kinds);
+            }
+            $log = $entry['log'];
+            if ($status === self::STATUS_UNUSED) {
+                if ($log['hits'] > 0) {
+                    $status = self::STATUS_REQUESTED;
+                } elseif ($log['bots'] > 0) {
+                    $status = self::STATUS_REVIEW;
+                    $reasons[] = 'nur von Bots abgerufen (' . $log['bots'] . 'x) – URL ist vermutlich in Suchmaschinen indexiert';
+                } elseif (isset($folderReferenced[$entry['folder']])) {
                     $status = self::STATUS_REVIEW;
                     $reasons[] = 'der ganze Ordner wird referenziert (siehe Zusammenfassung)';
+                } elseif ($entry['usages'] === []) {
+                    $reasons[] = 'keine Verwendung gefunden';
                 }
+            }
+            if ($log['hits'] > 0) {
+                $reasons[] = 'Access-Log: ' . $log['hits'] . ' Abrufe (' . count($log['extern']) . ' externe, '
+                    . count($log['intern']) . ' interne Referer-Seiten)';
+            }
+            if ($log['intern_pages'] !== [] && $counts['aktiv'] === 0) {
+                $reasons[] = 'ACHTUNG: wird von TYPO3-Seite(n) ' . implode(', ', array_keys($log['intern_pages']))
+                    . ' verlinkt, aber keine aktive Referenz gefunden (gecachte Seite oder dynamisch erzeugter Link?)';
             }
             if (!$entry['on_disk']) {
                 $reasons[] = $counts['aktiv'] > 0 ? 'ACHTUNG: Datei fehlt auf der Platte, wird aber verwendet' : 'Datei fehlt auf der Platte (nur sys_file-Eintrag)';
@@ -1012,7 +1117,7 @@ final class MigratedAnalyzer
                 $reasons[] = 'identische Kopie vorhanden';
             }
             $entry['status'] = $status;
-            $entry['reason'] = implode('; ', $reasons);
+            $entry['reason'] = implode('; ', array_filter($reasons));
         }
         unset($entry);
     }
@@ -1027,77 +1132,98 @@ final class MigratedAnalyzer
             throw new \RuntimeException("Ausgabeverzeichnis kann nicht angelegt werden: $outDir");
         }
         $fmtDate = static fn (?int $ts): string => $ts ? date('Y-m-d H:i', $ts) : '';
+        $topList = static function (array $counts, int $max): string {
+            arsort($counts);
+            $items = array_map(static fn ($k, $v) => "$k ($v)", array_keys($counts), $counts);
+            return implode(' | ', array_slice($items, 0, $max)) . (count($items) > $max ? ' | … (+' . (count($items) - $max) . ')' : '');
+        };
 
         $filesCsv = $this->openCsv("$outDir/dateien.csv", [
-            'pfad', 'ordner', 'status', 'empfehlung', 'begruendung', 'auf_disk', 'groesse_bytes', 'groesse',
-            'datei_geaendert', 'sys_file_uid', 'verwendungen_aktiv', 'verwendungen_pruefen', 'verwendungen_geloescht',
-            'davon_text_code_funde', 'sites', 'seiten', 'eingebunden_von', 'duplikate',
-            'log_abrufe', 'log_abrufe_bots', 'log_letzter_abruf', 'log_top_referer', 'datei_aktionen_sys_log',
+            'pfad', 'ordner', 'status', 'empfehlung', 'begruendung', 'domains', 'seiten', 'auf_disk', 'groesse_bytes', 'groesse',
+            'datei_geaendert', 'sys_file_uid', 'verwendungen_aktiv', 'verwendungen_versteckt', 'verwendungen_papierkorb',
+            'verwendungen_verwaist', 'davon_text_code_funde', 'duplikate', 'log_abrufe', 'log_abrufe_bots', 'log_letzter_abruf',
+            'log_domains', 'log_referer_typo3_seiten', 'log_referer_extern', 'datei_aktionen_sys_log',
         ]);
         $usageCsv = $this->openCsv("$outDir/verwendungen.csv", [
             'pfad', 'sys_file_uid', 'datei_status', 'quelle', 'tabelle', 'feld', 'datensatz_uid', 'datensatz_titel',
-            'ctype', 'sprache', 'verwendung_status', 'grund', 'referenz_uid', 'seite_uid', 'seite_titel', 'seitenpfad',
-            'seitentyp', 'site', 'url', 'datensatz_erstellt', 'erstellt_von', 'datensatz_geaendert',
-            'zuletzt_geaendert_von', 'referenz_angelegt_von', 'fundstelle',
+            'ctype', 'sprache', 'verwendung_status', 'grund', 'referenz_uid', 'domain', 'site', 'url', 'seite_uid', 'seite_titel',
+            'seitenpfad', 'seitentyp', 'datensatz_erstellt', 'datensatz_geaendert', 'erstellt_von', 'zuletzt_geaendert_von', 'fundstelle',
         ]);
+        $domainCsv = $this->openCsv("$outDir/domain_dateien.csv", ['domain', 'pfad', 'verwendung', 'datei_status', 'seiten', 'groesse_bytes']);
 
         $stats = [];
-        $siteStats = [];
+        $domainStats = [];
         $missingButUsed = [];
+        $internalNoRef = [];
         $deleteList = [];
-        $deletedOnlyList = [];
+        $usageRank = array_flip(array_keys(self::USAGE_LABEL));
 
         foreach ($this->files as $entry) {
-            $sites = [];
+            $domains = [];     // Domain => bester Verwendungs-Status
+            $domainPages = []; // Domain => [Seiten]
             $pages = [];
-            $users = [];
             foreach ($entry['usages'] as $u) {
                 $rec = $u['table'] !== null && $u['uid'] !== null ? $this->resolveRecord($u['table'], $u['uid']) : ['exists' => false];
                 $page = !empty($rec['exists']) && $rec['page'] > 0 ? $this->pageInfo($rec['page']) : null;
+                $lang = (int)($rec['lang'] ?? 0);
+                $domain = $page !== null && $page['exists'] ? $this->domainFor($page, $lang) : ($u['table'] === null ? '(Code/Konfiguration)' : '');
                 $who = !empty($rec['exists']) ? $this->who($u['table'], $u['uid']) : ['creator' => null, 'last' => null];
-                $refWho = $u['ref_uid'] ? $this->who('sys_file_reference', $u['ref_uid']) : ['creator' => null];
-                $creator = $who['creator'] ? $this->userLabel($who['creator'][2]) : (isset($rec['cruser']) && $rec['cruser'] ? $this->userLabel($rec['cruser']) : '');
+                $creator = $who['creator'] ? $this->userLabel($who['creator'][2]) : (!empty($rec['cruser']) ? $this->userLabel($rec['cruser']) : '');
                 $lastEditor = $who['last'] ? $this->userLabel($who['last'][2]) . ' (' . date('Y-m-d', $who['last'][0]) . ')' : '';
-                $refCreator = $refWho['creator'] ? $this->userLabel($refWho['creator'][2]) . ' (' . date('Y-m-d', $refWho['creator'][0]) . ')' : '';
 
-                if ($u['status'] !== 'geloescht') {
+                if ($u['status'] !== 'verwaist' && $domain !== '') {
+                    if (!isset($domains[$domain]) || $usageRank[$u['status']] < $usageRank[$domains[$domain]]) {
+                        $domains[$domain] = $u['status'];
+                    }
                     if ($page !== null) {
-                        $site = $page['site'] !== '' ? $page['site'] : '(keine Site)';
-                        $sites[$site] = true;
                         $pages[$rec['page']] = $rec['page'] . ':' . $page['title'];
-                    } elseif ($u['table'] === null) {
-                        $sites['(Code/Konfiguration)'] = true;
-                    }
-                    foreach ([$refCreator !== '' ? preg_replace('/ \(\d{4}-.*$/', '', $refCreator) : '', $creator] as $name) {
-                        if ($name !== '') {
-                            $users[$name] = true;
-                        }
-                    }
-                    if ($u['status'] === 'aktiv' && $page !== null && $page['site'] !== '') {
-                        $siteStats[$page['site']][$entry['identifier']] = true;
+                        $domainPages[$domain][$rec['page']] = $rec['page'] . ':' . $page['title'];
                     }
                 }
 
                 $this->writeCsv($usageCsv, [
                     $entry['path'], $entry['uid'], $entry['status'], implode('+', array_keys($u['sources'])),
                     $u['table'], $u['field'], $u['uid'], $rec['label'] ?? '', $rec['ctype'] ?? '', $rec['lang'] ?? '',
-                    $u['status'], $u['status_reason'], $u['ref_uid'], $page !== null ? $rec['page'] : '',
-                    $page['title'] ?? '', $page['path'] ?? '', $page !== null ? $this->doktypeLabel($page['doktype']) : '',
-                    $page['site'] ?? '', $page['url'] ?? '', $fmtDate($rec['crdate'] ?? null), $creator,
-                    $fmtDate($rec['tstamp'] ?? null), $lastEditor, $refCreator, $u['location'],
+                    self::USAGE_LABEL[$u['status']], $u['status_reason'], $u['ref_uid'], $domain, $page['site'] ?? '',
+                    $page !== null && $page['exists'] ? $this->urlFor($rec['page'], $page, $lang) : '',
+                    $page !== null ? $rec['page'] : '', $page['title'] ?? '', $page['path'] ?? '',
+                    $page !== null ? $this->doktypeLabel($page['doktype']) : '', $fmtDate($rec['crdate'] ?? null),
+                    $fmtDate($rec['tstamp'] ?? null), $creator, $lastEditor, $u['location'],
                 ]);
             }
 
-            arsort($entry['log']['referers']);
-            $referers = array_map(static fn ($h, $c) => "$h ($c)", array_keys($entry['log']['referers']), $entry['log']['referers']);
+            // Domains aus dem Access-Log, falls TYPO3 die Datei nicht (mehr) kennt
+            $usageGroup = static fn (string $usage): string => match ($usage) {
+                'aktiv' => 'aktiv',
+                'papierkorb' => 'Papierkorb',
+                'unbekannt' => 'unbekannt',
+                default => 'versteckt',
+            };
+            $domainRows = [];
+            foreach ($domains as $domain => $usage) {
+                $domainRows[$domain] = $usageGroup($usage);
+            }
+            foreach (array_keys($entry['log']['domains']) as $domain) {
+                $domainRows[$domain] ??= 'nur Log-Abrufe';
+            }
+            ksort($domainRows);
+            foreach ($domainRows as $domain => $group) {
+                $domainStats[$domain][$group] = ($domainStats[$domain][$group] ?? 0) + 1;
+                $this->writeCsv($domainCsv, [$domain, $entry['path'], $group, $entry['status'],
+                    $this->limitList(array_values($domainPages[$domain] ?? []), 10), $entry['size']]);
+            }
+
+            $log = $entry['log'];
+            $versteckt = $entry['counts']['versteckt'] + $entry['counts']['workspace'] + $entry['counts']['sysordner'] + $entry['counts']['ausserhalb_site'];
             $this->writeCsv($filesCsv, [
                 $entry['path'], $entry['folder'], $entry['status'], self::RECOMMENDATION[$entry['status']], $entry['reason'],
-                $entry['on_disk'] ? 'ja' : 'nein', $entry['size'], $this->humanSize($entry['size']), $fmtDate($entry['mtime']),
-                $entry['uid'], $entry['counts']['aktiv'], $entry['counts']['pruefen'], $entry['counts']['geloescht'],
-                $entry['counts']['text'], implode(', ', array_keys($sites)), $this->limitList(array_values($pages), 10),
-                implode(', ', array_keys($users)), $this->limitList(array_values(array_unique($entry['duplicates'])), 5),
-                $entry['log']['hits'], $entry['log']['bots'], $fmtDate($entry['log']['last']),
-                implode(', ', array_slice($referers, 0, 3)), $this->limitList($entry['file_log'], 5),
+                implode(', ', array_map(static fn ($d, $g) => "$d ($g)", array_keys($domainRows), $domainRows)),
+                $this->limitList(array_values($pages), 10), $entry['on_disk'] ? 'ja' : 'nein', $entry['size'],
+                $this->humanSize($entry['size']), $fmtDate($entry['mtime']), $entry['uid'], $entry['counts']['aktiv'], $versteckt,
+                $entry['counts']['papierkorb'], $entry['counts']['verwaist'], $entry['counts']['text'],
+                $this->limitList(array_values(array_unique($entry['duplicates'])), 5),
+                $log['hits'], $log['bots'], $fmtDate($log['last']), $topList($log['domains'], 5),
+                $topList($log['intern'], 5), $topList($log['extern'], 5), $this->limitList($entry['file_log'], 5),
             ]);
 
             $s = &$stats[$entry['folder']];
@@ -1112,36 +1238,44 @@ final class MigratedAnalyzer
             if (!$entry['on_disk'] && $entry['counts']['aktiv'] > 0) {
                 $missingButUsed[] = $entry['path'];
             }
+            if ($log['intern_pages'] !== [] && $entry['counts']['aktiv'] === 0) {
+                $internalNoRef[] = $entry['path'] . ' ← ' . implode(' | ', array_keys($log['intern']));
+            }
             if ($entry['on_disk'] && $entry['status'] === self::STATUS_UNUSED) {
                 $deleteList[] = $entry['identifier'];
-            }
-            if ($entry['on_disk'] && $entry['status'] === self::STATUS_DELETED_ONLY) {
-                $deletedOnlyList[] = $entry['identifier'];
             }
         }
         fclose($filesCsv);
         fclose($usageCsv);
+        fclose($domainCsv);
 
         file_put_contents("$outDir/loeschkandidaten.txt", $this->listFile($deleteList, self::STATUS_UNUSED));
-        file_put_contents("$outDir/loeschkandidaten_nur_geloeschte_referenzen.txt", $this->listFile($deletedOnlyList, self::STATUS_DELETED_ONLY));
-        file_put_contents("$outDir/zusammenfassung.md", $this->summary($stats, $siteStats, $missingButUsed));
+        file_put_contents("$outDir/zusammenfassung.md", $this->summary($stats, $domainStats, $missingButUsed, $internalNoRef));
     }
 
-    private function summary(array $stats, array $siteStats, array $missingButUsed): string
+    private function summary(array $stats, array $domainStats, array $missingButUsed, array $internalNoRef): string
     {
-        $statuses = [self::STATUS_IN_USE, self::STATUS_REVIEW, self::STATUS_DELETED_ONLY, self::STATUS_UNUSED];
+        $statuses = self::STATUSES;
         $md = "# Analyse fileadmin/_migrated\n\n";
         $md .= '- Erstellt: ' . date('Y-m-d H:i') . "\n";
         $md .= '- TYPO3-Projekt: `' . $this->env->root . '` (Version ' . $this->env->typo3Version() . ")\n";
         $md .= '- Datenbank: `' . $this->db->name . '`, fileadmin-Storage-UID: ' . $this->storage . "\n";
         $md .= '- Sites: ' . ($this->sites === [] ? '(keine gefunden)' : implode(', ', array_map(
-            static fn ($s) => $s['identifier'] . ' → ' . ($s['base'] ?: '?') . ' (Root ' . $s['rootPageId'] . ')', $this->sites))) . "\n";
+            static fn ($s) => $s['identifier'] . ' → ' . (implode(', ', $s['hosts']) ?: $s['base'] ?: '?') . ' (Root ' . $s['rootPageId'] . ')', $this->sites))) . "\n";
         $md .= '- Prüfungen: sys_file_reference, sys_refindex' . ($this->textScan ? ', DB-Textfelder' : '')
             . ', sys_log' . ($this->fsScan ? ', Dateisystem (TypoScript/Templates/Config)' : '')
             . ($this->accessLogs !== [] ? ', Access-Logs' : '') . "\n";
-        if ($this->logStats['files'] > 0) {
-            $md .= sprintf("- Access-Logs: %d Dateien, %d Zeilen, Zeitraum %s bis %s\n", $this->logStats['files'], $this->logStats['lines'],
-                $this->logStats['from'] ? date('Y-m-d', $this->logStats['from']) : '?', $this->logStats['to'] ? date('Y-m-d', $this->logStats['to']) : '?');
+        if ($this->accessLog !== null && $this->accessLog->files > 0) {
+            $days = $this->accessLog->from && $this->accessLog->to ? (int)ceil(($this->accessLog->to - $this->accessLog->from) / 86400) : 0;
+            $md .= sprintf("- Access-Logs: %d Dateien, %d Zeilen, Zeitraum %s bis %s (%d Tage)\n", $this->accessLog->files, $this->accessLog->lines,
+                $this->accessLog->from ? date('Y-m-d', $this->accessLog->from) : '?', $this->accessLog->to ? date('Y-m-d', $this->accessLog->to) : '?', $days);
+            if ($days < 60) {
+                $this->warnings[] = "Die Access-Logs decken nur $days Tage ab. Selten genutzte Links (z. B. PDFs in alten E-Mails) "
+                    . 'fallen dadurch evtl. nicht auf – Logs länger aufbewahren oder die Quarantäne-Frist entsprechend lang wählen.';
+            }
+        } else {
+            $this->warnings[] = 'Keine Access-Logs ausgewertet – UNBENUTZT bedeutet nur "in TYPO3 nicht referenziert". '
+                . 'Externe Links werden erst mit --access-log erkannt.';
         }
         $warnings = array_merge($this->env->warnings, $this->warnings);
         if ($warnings !== []) {
@@ -1175,16 +1309,20 @@ final class MigratedAnalyzer
             $md .= "- **$st**: " . self::RECOMMENDATION[$st] . "\n";
         }
 
-        if ($siteStats !== []) {
-            $md .= "\n## Aktiv verwendete Dateien je Site\n\n| Site | Domain | Dateien |\n|---|---|---:|\n";
-            $bases = [];
-            foreach ($this->sites as $s) {
-                $bases[$s['identifier']] = $s['base'];
+        if ($domainStats !== []) {
+            $groups = ['aktiv', 'versteckt', 'Papierkorb', 'nur Log-Abrufe', 'unbekannt'];
+            $md .= "\n## Dateien je Domain\n\nEine Datei kann mehreren Domains zugeordnet sein (Details: `domain_dateien.csv`).\n\n"
+                . '| Domain | ' . implode(' | ', $groups) . " |\n|---|" . str_repeat('---:|', count($groups)) . "\n";
+            ksort($domainStats);
+            foreach ($domainStats as $domain => $counts) {
+                $md .= "| $domain | " . implode(' | ', array_map(static fn ($g) => $counts[$g] ?? 0, $groups)) . " |\n";
             }
-            ksort($siteStats);
-            foreach ($siteStats as $site => $files) {
-                $md .= "| $site | " . ($bases[$site] ?? '') . ' | ' . count($files) . " |\n";
-            }
+        }
+        if ($internalNoRef !== []) {
+            $md .= "\n## Von TYPO3-Seiten verlinkt, aber keine aktive Referenz gefunden\n\n"
+                . "Laut Referer im Access-Log werden diese Dateien von Seiten der eigenen Domains aufgerufen, in der Datenbank "
+                . "wurde aber keine aktive Einbindung gefunden (z. B. veralteter Seiten-Cache, dynamisch erzeugter Link, Extension).\n\n"
+                . $this->mdList($internalNoRef, 50);
         }
         if ($missingButUsed !== []) {
             $md .= "\n## Verwendete Dateien, die auf der Platte fehlen (defekte Bilder/Downloads!)\n\n"
@@ -1211,10 +1349,10 @@ final class MigratedAnalyzer
                 . $this->mdList(array_map(static fn ($f) => "`_migrated/$f` – mit `--folders=all` einbeziehen", $this->otherMigratedFolders), 50);
         }
         $md .= "\n## Dateien\n\n"
-            . "- `dateien.csv` – eine Zeile pro Datei mit Status und Empfehlung\n"
-            . "- `verwendungen.csv` – eine Zeile pro Fundstelle (Datensatz, Seite, Site, URL, Bearbeiter)\n"
-            . "- `loeschkandidaten.txt` – Eingabe für `bin/migrated-quarantine.php`\n"
-            . "- `loeschkandidaten_nur_geloeschte_referenzen.txt` – zweite Stufe, nach Leeren des Papierkorbs\n";
+            . "- `dateien.csv` – eine Zeile pro Datei mit Status, Domains, Seiten und Access-Log-Auswertung\n"
+            . "- `domain_dateien.csv` – eine Zeile pro Datei und Domain (zum Filtern je Domain)\n"
+            . "- `verwendungen.csv` – eine Zeile pro Fundstelle (Datensatz, Seite, Domain, URL)\n"
+            . "- `loeschkandidaten.txt` – nur Status UNBENUTZT, Eingabe für `bin/migrated-quarantine.php`\n";
         return $md;
     }
 

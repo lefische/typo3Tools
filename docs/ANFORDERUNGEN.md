@@ -1,6 +1,6 @@
 # Anforderungen: Bereinigung von `fileadmin/_migrated`
 
-Stand: Entwurf v1 – Abschnitt 6 enthält die offenen Fragen, die vor dem Löschen geklärt werden sollten.
+Stand: v2 – Entscheidungen aus der Abstimmung in Abschnitt 6 eingearbeitet, verbleibende Fragen in Abschnitt 7.
 
 ## 1. Ausgangslage
 
@@ -16,9 +16,10 @@ Stand: Entwurf v1 – Abschnitt 6 enthält die offenen Fragen, die vor dem Lösc
 | Z1 | Vollständige Übersicht über alle Dateien in den drei Ordnern | Anzahl/Größe je Ordner, abgeglichen mit `sys_file` |
 | Z2 | Für jede Datei: alle Stellen, an denen sie eingebunden oder verlinkt ist | `verwendungen.csv` |
 | Z3 | Zuordnung zu Seite, Site und Domain | Seite, Seitenpfad, Site, URL je Fundstelle |
-| Z4 | Verantwortliche ermitteln („von wem“) | Ersteller/Bearbeiter des einbindenden Inhalts |
+| Z4 | „Von wem“ = **Domain** – auch für versteckte und gelöschte Verwendungen | Domain je Datei/Fundstelle, `domain_dateien.csv` |
 | Z5 | Entscheidungsgrundlage: behalten / prüfen / löschen | Status + Begründung je Datei |
-| Z6 | Sicheres, umkehrbares Entfernen | Quarantäne mit Manifest und Wiederherstellung |
+| Z6 | Links von außen und von TYPO3-Seiten funktionieren weiter | Access-Log-Auswertung, Referer → TYPO3-Seite, Beobachtung in der Quarantäne |
+| Z7 | Sicheres, umkehrbares Entfernen | Quarantäne mit Manifest, Wiederherstellung, automatisches Zurückholen bei Abruf |
 
 Nicht-Ziel (vorerst): Dateien in eine neue Ordnerstruktur umziehen. Das kann über die TYPO3-Dateiliste erfolgen,
 weil FAL-Referenzen beim Verschieben erhalten bleiben – Grundlage ist die Liste der Dateien mit `IN_VERWENDUNG` je Site.
@@ -45,17 +46,24 @@ weil FAL-Referenzen beim Verschieben erhalten bleiben – Grundlage ist die List
 ### F3 Kontext je Fundstelle
 - F3.1 Datensatz: Tabelle, Feld, UID, Titel, Inhaltstyp, Sprache, Status (gelöscht/versteckt/Zeitsteuerung/Workspace).
 - F3.2 Seite: Titel, Seitentyp, Rootline, Sichtbarkeit unter Berücksichtigung der Elternseiten.
-- F3.3 Site: Zuordnung über `config/sites/*/config.yaml` (rootPageId → base/Domain), URL der Seite.
-- F3.4 Personen: Ersteller und letzter Bearbeiter des Datensatzes sowie wer die Datei angehängt hat
-  (`sys_history`, `sys_log`, ggf. `cruser_id`).
+- F3.3 Site und Domain: Zuordnung über `config/sites/*/config.yaml` (rootPageId → base, Sprach-Basen, baseVariants);
+  die Domain richtet sich nach der Sprache des Datensatzes. URL der Seite (Slug der Übersetzung).
+- F3.4 Die Domain wird auch für gelöschte Datensätze/Seiten (Papierkorb) und versteckte Seiten ermittelt.
+- F3.5 Access-Log: Domain des Abrufs (vhost/Logdateiname), Referer intern (→ TYPO3-Seite über Slug/`?id=`) oder extern.
+  Interne Referer ohne aktive Referenz in der DB werden hervorgehoben.
+- F3.6 Ersteller/Bearbeiter (`sys_history`, `sys_log`) nur informativ – die Historie ist gekürzt.
 
 ### F4 Klassifizierung
+Versteckte und gelöschte (Papierkorb-)Verwendungen gelten als Verwendung. Es gilt der Status mit der höchsten Priorität:
+
 | Status | Regel |
 |---|---|
 | `IN_VERWENDUNG` | ≥ 1 aktive Fundstelle (sichtbarer Datensatz auf sichtbarer Seite in einer Site, Datensatz auf Root-Ebene, oder Code/TypoScript) |
-| `PRUEFEN` | sonst ≥ 1 Fundstelle, die nicht öffentlich ist (versteckt, zeitgesteuert, Workspace, Inhalt in Ordner, Seite ohne Site); oder `UNBENUTZT`/`NUR_GELOESCHTE…` mit Log-Abrufen bzw. referenziertem Ordner |
-| `NUR_GELOESCHTE_REFERENZEN` | nur Fundstellen in gelöschten Datensätzen/Seiten oder verwaiste Referenzen |
-| `UNBENUTZT` | keine Fundstelle |
+| `VERSTECKT_VERWENDET` | ≥ 1 Fundstelle versteckt, zeitgesteuert, Workspace, Inhalt in Ordner, Seite ohne Site |
+| `IM_PAPIERKORB` | nur Fundstellen in gelöschten Datensätzen/Seiten (wiederherstellbar) |
+| `ABGERUFEN_OHNE_REFERENZ` | keine Fundstelle, aber Abrufe (keine Bots) im Access-Log |
+| `PRUEFEN` | Fundstelle ohne Datensatz-UID; oder sonst unbenutzt, aber Bot-Abrufe bzw. der ganze Ordner ist referenziert |
+| `UNBENUTZT` | keine Fundstelle (verwaiste Referenzen auf nicht existierende Datensätze zählen nicht) und keine Abrufe – **einziger Löschkandidat** |
 
 ### F5 Ausgabe
 - Zusammenfassung (Markdown) mit Mengen und Speicherplatz je Ordner und Status, Dateien je Site, Warnungen.
@@ -67,6 +75,8 @@ weil FAL-Referenzen beim Verschieben erhalten bleiben – Grundlage ist die List
 - F6.2 Erneute DB-Prüfung unmittelbar vor dem Verschieben; Liste darf nicht älter als 7 Tage sein.
 - F6.3 Ziel außerhalb des Web-Roots, Verzeichnisstruktur bleibt erhalten, Manifest mit SHA1.
 - F6.4 Wiederherstellung anhand des Manifests.
+- F6.4a Beobachtung: Abrufe verschobener Dateien im Access-Log seit dem Quarantäne-Zeitpunkt finden und genau diese
+  zurückholen (für einen täglichen Cronjob).
 - F6.5 SQL für die endgültige Bereinigung der `sys_file`-Einträge wird erzeugt, aber nicht ausgeführt.
 
 ## 4. Nicht-funktionale Anforderungen
@@ -84,33 +94,37 @@ weil FAL-Referenzen beim Verschieben erhalten bleiben – Grundlage ist die List
 3. `PRUEFEN`-Dateien mit den Site-Verantwortlichen klären (Filter in `dateien.csv` nach Site).
 4. `UNBENUTZT` in Quarantäne verschieben, Frist abwarten (Vorschlag: 4–8 Wochen), Fehlermeldungen/404 im Log beobachten.
 5. Nach der Frist: SQL-Bereinigung, Quarantäne löschen.
-6. Optional zweite Runde für `NUR_GELOESCHTE_REFERENZEN`, nachdem der Papierkorb geleert wurde
-   (z. B. `vendor/bin/typo3 cleanup:deletedrecords`).
 
-## 6. Offene Fragen
+## 6. Entscheidungen
 
-Bitte beantworten – davon hängen Regeln und Voreinstellungen ab:
+| # | Frage | Entscheidung | Umsetzung |
+|---|---|---|---|
+| 1 | Was bedeutet „von wem“? | die **Domain** | Domain je Fundstelle (Site + Sprache), je Datei und `domain_dateien.csv` |
+| 2 | Ist die Historie vollständig? | nein, gekürzt (Installation > 15 Jahre) | Redakteursangaben nur noch informativ in `verwendungen.csv` |
+| 3 | Gelten versteckte Inhalte/Papierkorb als unbenutzt? | **nein** – Domain trotzdem angeben | eigene Status `VERSTECKT_VERWENDET`, `IM_PAPIERKORB`; keine Löschkandidaten |
+| 4 | Sollen alte Links weiter funktionieren? | **ja**; prüfen, ob die verlinkenden Seiten in TYPO3 existieren | Log-Abrufe schützen vor Löschung; Referer → TYPO3-Seite; Beobachtung in der Quarantäne |
+| 5 | news/powermail? | nicht installiert | keine Sonderbehandlung nötig |
 
-1. **„Von wem“** – was ist gemeint?
-   a) welche **Website/Domain** die Datei nutzt (ist abgedeckt),
-   b) welche **Redakteurin/welcher Redakteur** den Inhalt gepflegt hat (abgedeckt, soweit `sys_history`/`sys_log` noch Daten haben),
-   c) die **ursprüngliche Quelle** vor der Migration (alte TYPO3-Version, alte Domain)? Für c) bräuchte man ein altes DB-Backup.
-2. **Aufbewahrung der Historie**: Läuft ein Scheduler-Task, der `sys_history`/`sys_log` kürzt? Wenn ja, wie lange reicht sie zurück?
-3. **Papierkorb**: Dürfen gelöschte Inhalte endgültig verworfen werden? Dann können `NUR_GELOESCHTE_REFERENZEN` mit weg.
-4. **Versteckte Inhalte/Seiten**: Gelten sie als „in Verwendung“ (könnten wieder aktiviert werden) oder als löschbar?
-5. **Workspaces**: Werden Workspaces genutzt?
-6. **Externe Verlinkung**: Ist es wichtig, dass alte direkte Links (z. B. PDFs in E-Mails, auf Partnerseiten, bei Google) weiter funktionieren?
-   Dann Logs über einen längeren Zeitraum auswerten, ggf. Weiterleitungen auf neue Pfade.
-7. **Logs**: Apache oder nginx? Pfad, Rotationsdauer, eigene Logs pro Domain (vhost)?
-8. **Weitere Systeme**: Greifen andere Anwendungen (Newsletter-Tool, App, Intranet) direkt auf Dateien in `fileadmin` zu?
-9. **Extensions**: Welche Extensions mit eigenen Datei-Feldern sind installiert (z. B. `news`, `powermail`, eigene)?
-   Werden Dateien dort per Pfad statt per FAL gespeichert? (Die Volltextsuche findet Pfade; reine Dateinamen ohne Pfad nicht.)
-10. **Verantwortlichkeit**: Wer entscheidet je Site über `PRUEFEN`-Fälle? Soll pro Site eine eigene Liste erzeugt werden?
-11. **Aufräumen statt Löschen**: Sollen verwendete Dateien in eine sinnvolle Struktur (z. B. `fileadmin/<site>/…`) umgezogen werden?
-    Das könnte ein nächstes Skript vorbereiten (Vorschlagsliste je Site, Umzug über die TYPO3-API, damit Referenzen erhalten bleiben).
-12. **Backup**: Gibt es ein aktuelles Backup von `fileadmin` und Datenbank, und wie lange soll die Quarantäne bestehen?
+## 7. Verbleibende offene Fragen
 
-## 7. Mögliche Erweiterungen
+Die Fragen 1–5 der ersten Fassung sind in Abschnitt 6 beantwortet. Offen sind noch:
+
+1. **Logs**: Apache oder nginx? Pfad und Rotationsdauer? Gibt es eigene Logs je Domain (vHost) bzw. das Format
+   `vhost_combined`? Ohne Domain im Log ist bei Abrufen ohne Referer nicht erkennbar, über welche Domain sie kamen.
+2. **Log-Aufbewahrung**: Können die Logs künftig länger aufbewahrt werden (Vorschlag: ≥ 6 Monate), damit auch selten
+   genutzte Links (PDF in alten E-Mails, Partnerseiten) sicher erkannt werden?
+3. **Quarantäne-Frist**: Wie lange sollen Löschkandidaten in Quarantäne bleiben (Vorschlag: 3–6 Monate mit täglicher
+   Beobachtung per `--requested`)?
+4. **Bot-Abrufe**: Sollen Dateien, die nur noch von Suchmaschinen abgerufen werden, gelöscht werden dürfen
+   (derzeit Status `PRUEFEN`)?
+5. **Workspaces**: Werden Workspaces genutzt? (Workspace-Versionen gelten derzeit als „versteckt verwendet“.)
+6. **Weitere Systeme**: Greifen andere Anwendungen (Newsletter-Tool, App, Intranet) direkt auf Dateien in `fileadmin` zu?
+7. **Eigene Extensions**: Speichern sie Dateipfade ohne `fileadmin/_migrated/`-Präfix (z. B. nur Dateinamen)? Das findet die Suche nicht.
+8. **Aufräumen statt Löschen**: Sollen verwendete Dateien je Domain in eine sinnvolle Struktur (z. B. `fileadmin/<domain>/…`)
+   umgezogen werden? Dann bräuchte es für extern aufgerufene Dateien 301-Weiterleitungen, damit alte Links funktionieren.
+9. **Backup**: Gibt es ein aktuelles Backup von `fileadmin` und Datenbank?
+
+## 8. Mögliche Erweiterungen
 
 - Bericht je Site (eigene CSV/Mail an Verantwortliche).
 - HTML-Bericht mit Vorschaubildern.

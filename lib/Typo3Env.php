@@ -158,7 +158,8 @@ final class Typo3Env
     }
 
     /**
-     * @return array<int, array{identifier:string, rootPageId:int, base:string}> indiziert nach rootPageId
+     * @return array<int, array{identifier:string, rootPageId:int, base:string, languages:array<int,string>, hosts:string[]}>
+     *         indiziert nach rootPageId; languages = languageId => absolute Basis-URL
      */
     public function sites(): array
     {
@@ -173,13 +174,53 @@ final class Typo3Env
             if ($rootPageId <= 0) {
                 continue;
             }
+            $base = (string)($data['base'] ?? '');
+            $languages = [];
+            $bases = [$base];
+            foreach ($data['languages'] ?? [] as $language) {
+                if (is_array($language) && isset($language['languageId'])) {
+                    $languages[(int)$language['languageId']] = self::absoluteBase($base, (string)($language['base'] ?? '/'));
+                    $bases[] = $languages[(int)$language['languageId']];
+                }
+            }
+            foreach ($data['baseVariants'] ?? [] as $variant) {
+                if (is_array($variant) && !empty($variant['base'])) {
+                    $bases[] = (string)$variant['base'];
+                }
+            }
+            $hosts = [];
+            foreach ($bases as $b) {
+                $host = self::host($b);
+                if ($host !== '') {
+                    $hosts[$host] = true;
+                }
+            }
             $sites[$rootPageId] = [
                 'identifier' => basename(dirname($file)),
                 'rootPageId' => $rootPageId,
-                'base' => (string)($data['base'] ?? ''),
+                'base' => $base,
+                'languages' => $languages,
+                'hosts' => array_keys($hosts),
             ];
         }
         return $sites;
+    }
+
+    /** Sprach-Basis ("/en/" oder "https://example.com/") relativ zur Site-Basis auflösen */
+    public static function absoluteBase(string $siteBase, string $languageBase): string
+    {
+        if (preg_match('~^(https?:)?//~i', $languageBase)) {
+            return $languageBase;
+        }
+        if (preg_match('~^(https?:)?//~i', $siteBase)) {
+            return rtrim($siteBase, '/') . '/' . ltrim($languageBase, '/');
+        }
+        return $languageBase;
+    }
+
+    public static function host(string $url): string
+    {
+        return strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
     }
 
     public function typo3Version(): string
@@ -220,6 +261,14 @@ final class Typo3Env
         }
         if (preg_match('/^base:\s*[\'"]?([^\'"\r\n]+)/m', $content, $m)) {
             $data['base'] = trim($m[1]);
+        }
+        if (preg_match('/^languages:\s*$(.*?)(?=^\S|\z)/ms', $content, $m)) {
+            foreach (preg_split('/^\s*-\s+/m', $m[1]) ?: [] as $chunk) {
+                if (preg_match('/(?:^|\s)languageId:\s*[\'"]?(\d+)/', $chunk, $l)) {
+                    preg_match('/(?:^|\s)base:\s*[\'"]?([^\'"\r\n]+)/', $chunk, $b);
+                    $data['languages'][] = ['languageId' => (int)$l[1], 'base' => trim($b[1] ?? '/')];
+                }
+            }
         }
         return $data;
     }
@@ -287,5 +336,99 @@ final class Db
     public static function placeholders(array $values): string
     {
         return implode(',', array_fill(0, count($values), '?'));
+    }
+}
+
+/**
+ * Liest Apache/nginx-Access-Logs im (vhost_)combined-Format, auch .gz.
+ */
+final class AccessLog
+{
+    public const BOT_PATTERN = '/bot|crawl|spider|slurp|preview|facebookexternalhit|curl|wget|python|java\/|monitor|uptime|scan/i';
+
+    public int $files = 0;
+    public int $lines = 0;
+    public ?int $from = null;
+    public ?int $to = null;
+    /** @var string[] */
+    public array $warnings = [];
+
+    /** @param string[] $globs */
+    public function __construct(private readonly array $globs)
+    {
+    }
+
+    /**
+     * Liefert alle Anfragen, deren Pfad $needle enthält.
+     * @return \Generator<array{ts:?int, path:string, status:int, referer:string, agent:string, bot:bool, host:string}>
+     */
+    public function entries(string $needle): \Generator
+    {
+        $logFiles = [];
+        foreach ($this->globs as $pattern) {
+            foreach (glob($pattern) ?: [] as $f) {
+                if (is_file($f)) {
+                    $logFiles[$f] = true;
+                }
+            }
+        }
+        if ($logFiles === []) {
+            $this->warnings[] = 'Keine Access-Logs gefunden für: ' . implode(', ', $this->globs);
+            return;
+        }
+        foreach (array_keys($logFiles) as $logFile) {
+            $h = @gzopen($logFile, 'rb'); // liest auch unkomprimierte Dateien
+            if ($h === false) {
+                $this->warnings[] = "Log nicht lesbar (Rechte?): $logFile";
+                continue;
+            }
+            $this->files++;
+            $fileHost = self::hostFromFilename($logFile);
+            while (($line = gzgets($h)) !== false) {
+                $this->lines++;
+                if (!str_contains($line, $needle)) {
+                    continue;
+                }
+                $entry = self::parse($line, $fileHost);
+                if ($entry === null) {
+                    continue;
+                }
+                if ($entry['ts'] !== null) {
+                    $this->from = min($this->from ?? $entry['ts'], $entry['ts']);
+                    $this->to = max($this->to ?? $entry['ts'], $entry['ts']);
+                }
+                if (str_contains($entry['path'], $needle)) {
+                    yield $entry;
+                }
+            }
+            gzclose($h);
+        }
+    }
+
+    public static function parse(string $line, string $fileHost = ''): ?array
+    {
+        // optionales "host:port " (vhost_combined), dann IP, ident, user, [Datum], "Request", Status, Bytes, "Referer" "User-Agent"
+        if (!preg_match('~^(?:(\S+?)(?::\d+)?\s+)?\S+ \S+ \S+ \[([^\]]+)\] "[A-Z]+ (\S+)[^"]*" (\d{3}) \S+(?: "([^"]*)" "([^"]*)")?~', $line, $m)) {
+            return null;
+        }
+        $ts = \DateTime::createFromFormat('d/M/Y:H:i:s O', $m[2]);
+        $agent = $m[6] ?? '';
+        $host = strtolower($m[1] ?? '');
+        return [
+            'ts' => $ts ? $ts->getTimestamp() : null,
+            'path' => rawurldecode((string)parse_url($m[3], PHP_URL_PATH)),
+            'status' => (int)$m[4],
+            'referer' => ($m[5] ?? '-') === '-' ? '' : $m[5],
+            'agent' => $agent,
+            'bot' => (bool)preg_match(self::BOT_PATTERN, $agent),
+            'host' => $host !== '' ? $host : $fileHost,
+        ];
+    }
+
+    /** z. B. /var/log/apache2/www.example.de-access.log.2.gz => www.example.de */
+    public static function hostFromFilename(string $file): string
+    {
+        $name = preg_replace(['~(\.\d+)?(\.gz)?$~i', '~\.log$~i', '~[-_.]?(ssl[-_.])?access.*$~i'], '', basename($file));
+        return preg_match('~^(?:[a-z0-9-]+\.)+[a-z]{2,}$~i', (string)$name) ? strtolower((string)$name) : '';
     }
 }

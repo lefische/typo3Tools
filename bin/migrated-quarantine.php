@@ -10,10 +10,13 @@ declare(strict_types=1);
  *  - Standard ist ein Probelauf; erst mit --execute wird verschoben.
  *  - Vor dem Verschieben wird jede Datei erneut gegen die DB geprüft.
  *  - Es entsteht ein Manifest, mit dem --restore alles zurückverschiebt.
+ *  - --requested sucht in den Access-Logs nach Aufrufen verschobener Dateien
+ *    (= jemand nutzt noch einen Link) und holt diese mit --execute zurück.
  *  - Für die spätere endgültige Bereinigung wird ein SQL-Skript erzeugt
  *    (wird NICHT ausgeführt).
  */
 
+use Typo3Tools\AccessLog;
 use Typo3Tools\Db;
 use Typo3Tools\Typo3Env;
 
@@ -24,6 +27,8 @@ Aufruf:
   Probelauf:   php bin/migrated-quarantine.php --root=/var/www/typo3 --list=report/loeschkandidaten.txt --target=/var/typo3-quarantaene
   Ausführen:   ... zusätzlich --execute
   Zurück:      php bin/migrated-quarantine.php --root=/var/www/typo3 --restore=/var/typo3-quarantaene/<lauf>/manifest.csv [--execute]
+  Beobachten:  php bin/migrated-quarantine.php --root=/var/www/typo3 --requested=/var/typo3-quarantaene/<lauf>/manifest.csv \
+                 --access-log='/var/log/apache2/*access.log*' [--execute]
 
 Optionen:
   --root=PFAD       TYPO3-Projektverzeichnis
@@ -34,11 +39,16 @@ Optionen:
   --no-recheck      Keine erneute Prüfung gegen die Datenbank (nicht empfohlen)
   --max-age=TAGE    Liste darf höchstens so alt sein (Standard 7)
   --restore=DATEI   Dateien laut Manifest zurückverschieben
+  --requested=DATEI Nur die Dateien des Manifests zurückholen, die seit der Quarantäne laut
+                    Access-Log aufgerufen wurden (benötigt --access-log, Bots zählen nicht)
+  --access-log=GLOB Access-Logs (mehrfach angebbar, .gz wird gelesen)
+  --include-bots    bei --requested auch Abrufe von Bots/Suchmaschinen berücksichtigen
   --db-host=, --db-port=, --db-name=, --db-user=, --db-socket=, --db-password= (oder TYPO3_DB_PASSWORD)
 
 TXT;
 
 $opts = getopt('h', ['root:', 'public:', 'list:', 'target:', 'execute', 'no-recheck', 'max-age:', 'restore:',
+    'requested:', 'access-log:', 'include-bots',
     'db-host:', 'db-port:', 'db-name:', 'db-user:', 'db-password:', 'db-socket:', 'help']);
 if (isset($opts['h']) || isset($opts['help']) || empty($opts['root'])) {
     fwrite(STDERR, USAGE);
@@ -52,41 +62,46 @@ $say = static function (string $msg): void {
 try {
     $env = new Typo3Env((string)$opts['root'], isset($opts['public']) ? (string)$opts['public'] : null);
 
-    // ---------------------------------------------------------------- Restore
-    if (isset($opts['restore'])) {
-        $manifest = (string)$opts['restore'];
-        $h = @fopen($manifest, 'rb');
-        if ($h === false) {
-            throw new RuntimeException("Manifest nicht lesbar: $manifest");
-        }
-        fgetcsv($h, null, ';', '"', ''); // Kopfzeile
-        $ok = $skip = 0;
-        while (($row = fgetcsv($h, null, ';', '"', '')) !== false) {
-            [$original, $quarantined] = $row;
-            if (!is_file($quarantined)) {
-                $say("ÜBERSPRUNGEN (nicht in Quarantäne): $quarantined");
-                $skip++;
-                continue;
+    // ---------------------------------------------------------------- Restore / Beobachten
+    if (isset($opts['restore']) || isset($opts['requested'])) {
+        $rows = readManifest((string)($opts['restore'] ?? $opts['requested']));
+        if (isset($opts['requested'])) {
+            $globs = isset($opts['access-log']) ? (array)$opts['access-log'] : [];
+            if ($globs === []) {
+                throw new RuntimeException('--requested benötigt --access-log.');
             }
-            if (file_exists($original)) {
-                $say("ÜBERSPRUNGEN (Ziel existiert bereits): $original");
-                $skip++;
-                continue;
+            $byIdentifier = [];
+            foreach ($rows as $i => $row) {
+                $byIdentifier[substr($row['original'], strlen($env->fileadmin))] = $i;
             }
-            $say(($execute ? 'ZURÜCK: ' : 'würde zurück: ') . $original);
-            if ($execute) {
-                if (!is_dir(dirname($original))) {
-                    mkdir(dirname($original), 0775, true);
+            $log = new AccessLog($globs);
+            $hits = [];
+            foreach ($log->entries('/fileadmin/_migrated/') as $e) {
+                $identifier = substr($e['path'], strpos($e['path'], '/fileadmin/_migrated/') + strlen('/fileadmin'));
+                $i = $byIdentifier[$identifier] ?? null;
+                if ($i === null || ($e['bot'] && !isset($opts['include-bots'])) || ($e['ts'] !== null && $e['ts'] < $rows[$i]['since'])) {
+                    continue;
                 }
-                if (!rename($quarantined, $original)) {
-                    throw new RuntimeException("Zurückverschieben fehlgeschlagen: $quarantined");
+                $hits[$i][] = date('Y-m-d H:i', (int)$e['ts']) . ' ' . $e['status'] . ($e['host'] ? ' ' . $e['host'] : '')
+                    . ($e['referer'] !== '' ? ' von ' . $e['referer'] : '');
+            }
+            foreach ($log->warnings as $w) {
+                $say("WARNUNG: $w");
+            }
+            $say(sprintf('Access-Logs: %d Dateien, Zeitraum %s bis %s', $log->files,
+                $log->from ? date('Y-m-d', $log->from) : '?', $log->to ? date('Y-m-d', $log->to) : '?'));
+            foreach ($hits as $i => $list) {
+                $say(sprintf("\nAUFGERUFEN (%dx): %s", count($list), $rows[$i]['original']));
+                foreach (array_slice($list, 0, 5) as $line) {
+                    $say("  $line");
                 }
             }
-            $ok++;
+            $say($hits === [] ? "\nKeine der verschobenen Dateien wurde seit der Quarantäne aufgerufen." : '');
+            $rows = array_intersect_key($rows, $hits);
         }
-        fclose($h);
+        [$ok, $skip] = restoreRows($rows, $execute, $say);
         $say(sprintf("\n%s: %d Dateien, %d übersprungen.%s", $execute ? 'Wiederhergestellt' : 'Probelauf', $ok, $skip,
-            $execute ? "\nDanach im Backend ggf. den Scheduler-Task \"Dateiindex aktualisieren\" laufen lassen." : "\nMit --execute ausführen."));
+            $execute ? '' : ($ok > 0 ? "\nMit --execute zurückholen." : '')));
         exit(0);
     }
 
@@ -109,6 +124,9 @@ try {
         throw new RuntimeException('Das Quarantäne-Verzeichnis darf nicht im Web-Root liegen.');
     }
     $runDir = $targetBase . '/' . date('Ymd-His');
+    for ($n = 2; file_exists($runDir); $n++) {
+        $runDir = $targetBase . '/' . date('Ymd-His') . "-$n";
+    }
 
     $db = null;
     if (!isset($opts['no-recheck'])) {
@@ -214,7 +232,14 @@ function recheck(Db $db, string $identifier): array
     }
     $uid = (int)$file['uid'];
     $deleted = $db->has('sys_file_reference', 'deleted') ? 'AND deleted = 0' : '';
-    $refs = (int)$db->one("SELECT COUNT(*) AS c FROM sys_file_reference WHERE uid_local = ? $deleted", [$uid])['c'];
+    $refs = 0;
+    foreach ($db->all("SELECT tablenames, uid_foreign FROM sys_file_reference WHERE uid_local = ? $deleted", [$uid]) as $ref) {
+        // Referenzen auf nicht mehr existierende Datensätze (verwaist) zählen nicht
+        $table = (string)$ref['tablenames'];
+        if ($db->has($table, 'uid') && $db->one('SELECT uid FROM ' . Db::q($table) . ' WHERE uid = ?', [(int)$ref['uid_foreign']]) !== null) {
+            $refs++;
+        }
+    }
     if ($refs > 0) {
         return [$uid, "$refs nicht gelöschte Dateireferenz(en)"];
     }
@@ -249,4 +274,51 @@ function cleanupSql(array $uids): string
             . "DELETE FROM sys_file WHERE uid IN ($in);\n\n";
     }
     return $sql . "-- Anschließend: vendor/bin/typo3 referenceindex:update\n";
+}
+
+/** @return array<int, array{original:string, quarantined:string, since:int}> */
+function readManifest(string $manifest): array
+{
+    $h = @fopen($manifest, 'rb');
+    if ($h === false) {
+        throw new RuntimeException("Manifest nicht lesbar: $manifest");
+    }
+    fgetcsv($h, null, ';', '"', ''); // Kopfzeile
+    $rows = [];
+    while (($row = fgetcsv($h, null, ';', '"', '')) !== false) {
+        if (count($row) >= 2) {
+            $rows[] = ['original' => $row[0], 'quarantined' => $row[1], 'since' => (int)strtotime($row[5] ?? '')];
+        }
+    }
+    fclose($h);
+    return $rows;
+}
+
+/** @return array{0:int,1:int} [zurückgeholt, übersprungen] */
+function restoreRows(array $rows, bool $execute, callable $say): array
+{
+    $ok = $skip = 0;
+    foreach ($rows as $row) {
+        if (!is_file($row['quarantined'])) {
+            $say("ÜBERSPRUNGEN (nicht in Quarantäne): {$row['quarantined']}");
+            $skip++;
+            continue;
+        }
+        if (file_exists($row['original'])) {
+            $say("ÜBERSPRUNGEN (Ziel existiert bereits): {$row['original']}");
+            $skip++;
+            continue;
+        }
+        $say(($execute ? 'ZURÜCK: ' : 'würde zurück: ') . $row['original']);
+        if ($execute) {
+            if (!is_dir(dirname($row['original']))) {
+                mkdir(dirname($row['original']), 0775, true);
+            }
+            if (!rename($row['quarantined'], $row['original'])) {
+                throw new RuntimeException("Zurückverschieben fehlgeschlagen: {$row['quarantined']}");
+            }
+        }
+        $ok++;
+    }
+    return [$ok, $skip];
 }

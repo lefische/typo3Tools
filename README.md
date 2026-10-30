@@ -2,10 +2,11 @@
 
 Werkzeuge, um in einer TYPO3-13.4-Installation (Multi-Root, mehrere Domains) herauszufinden,
 
-- **woher** die Dateien in `fileadmin/_migrated/{content_uploads,media,pics}` stammen,
-- **wo** sie eingebunden sind (Datensatz → Seite → Site → Domain/URL),
-- **wer** die einbindenden Inhalte angelegt bzw. zuletzt geändert hat,
-- und **ob sie gelöscht werden können**.
+- zu **welcher Domain** die Dateien in `fileadmin/_migrated/{content_uploads,media,pics}` gehören –
+  auch wenn sie nur in versteckten oder gelöschten Inhalten (Papierkorb) stecken,
+- **wo** sie eingebunden sind (Datensatz → Seite → Site → Domain/URL, je Sprache),
+- ob sie **von außen oder von TYPO3-Seiten aufgerufen** werden (Access-Log inkl. Referer),
+- und **ob sie gelöscht werden können**, ohne dass ein Link kaputtgeht.
 
 Die fachliche Ausarbeitung, Annahmen und offenen Fragen stehen in [docs/ANFORDERUNGEN.md](docs/ANFORDERUNGEN.md).
 
@@ -82,32 +83,41 @@ Wichtige Optionen (vollständig mit `--help`):
    findet fest eingetragene Pfade (RTE, TypoScript in `sys_template`, FlexForms, Extension-Tabellen)
 6. **Dateisystem-Code** – `config/`, `packages/`, `typo3conf/ext/`, Textdateien in `fileadmin`, `.htaccess`
 7. **`sys_log`** – Datei-Aktionen im Backend (z. B. Umbenennen, Löschversuche) mit Benutzer
-8. **Access-Logs** (optional) – wird die Datei noch direkt aufgerufen (externe Links, Suchmaschinen)? Bots werden getrennt gezählt.
+8. **Access-Logs** – wird die Datei noch direkt aufgerufen? Ausgewertet werden:
+   - die **Domain**, unter der sie abgerufen wurde (aus `vhost_combined`-Logs oder dem Logdateinamen,
+     z. B. `www.example.de-access.log`),
+   - der **Referer**: kommt er von einer eigenen Domain, wird die URL über Slug und Sprache einer **TYPO3-Seite**
+     zugeordnet; sonst wird die externe Domain gezählt,
+   - Bots/Suchmaschinen getrennt.
 
 Für jede Fundstelle wird der Datensatz aufgelöst: gelöscht/versteckt/Zeitsteuerung/Workspace, Seite und deren
-Rootline (versteckte oder gelöschte Elternseiten), Site-Konfiguration (Domain), URL sowie aus
-`sys_history`/`sys_log` der Ersteller und letzte Bearbeiter.
+Rootline (versteckte oder gelöschte Elternseiten), Site-Konfiguration und Sprache → **Domain** und URL.
+Die Domain wird auch für Inhalte im Papierkorb und auf versteckten Seiten ermittelt.
 
 ### Ergebnis (im Ausgabeverzeichnis)
 
 | Datei | Inhalt |
 |---|---|
-| `zusammenfassung.md` | Überblick je Ordner und Status inkl. einsparbarem Speicher, Dateien je Site, Warnungen, defekte Verweise |
-| `dateien.csv` | eine Zeile je Datei: Status, Empfehlung, Begründung, Sites, Seiten, Bearbeiter, Duplikate, Log-Abrufe |
-| `verwendungen.csv` | eine Zeile je Fundstelle: Tabelle/Feld/UID, Seite, Seitenpfad, Site, URL, Ersteller, letzter Bearbeiter |
-| `loeschkandidaten.txt` | Dateien mit Status `UNBENUTZT` – Eingabe für Schritt 3 |
-| `loeschkandidaten_nur_geloeschte_referenzen.txt` | Dateien mit Status `NUR_GELOESCHTE_REFERENZEN` |
+| `zusammenfassung.md` | Überblick je Ordner und Status inkl. Speicherplatz, **Dateien je Domain**, Warnungen, defekte Verweise, von TYPO3-Seiten verlinkte Dateien ohne Referenz |
+| `dateien.csv` | eine Zeile je Datei: Status, Empfehlung, Begründung, **Domains** (mit aktiv/versteckt/Papierkorb), Seiten, Duplikate, Log-Abrufe, Log-Domains, Referer (TYPO3-Seiten / extern) |
+| `domain_dateien.csv` | eine Zeile je Datei **und Domain** – zum Filtern nach Domain |
+| `verwendungen.csv` | eine Zeile je Fundstelle: Tabelle/Feld/UID, Domain, Site, URL, Seite, Seitenpfad |
+| `loeschkandidaten.txt` | nur Dateien mit Status `UNBENUTZT` – Eingabe für Schritt 3 |
 
 Die CSV-Dateien sind UTF-8 mit BOM und Semikolon getrennt – sie lassen sich direkt in Excel/LibreOffice öffnen.
 
 ### Status
 
+Versteckte Inhalte und der Papierkorb gelten als **verwendet**. Nur `UNBENUTZT` ist ein Löschkandidat.
+
 | Status | Bedeutung | Empfehlung |
 |---|---|---|
-| `IN_VERWENDUNG` | mind. eine Einbindung in einem sichtbaren Datensatz auf einer sichtbaren Seite einer Site, oder Pfad in Code/TypoScript | behalten |
-| `PRUEFEN` | nur versteckte/zeitgesteuerte Datensätze, versteckte Seiten, Workspace, Ordner (Datensatz einfügen), Seiten ohne Site; oder Abrufe im Access-Log; oder der ganze Ordner ist referenziert | manuell entscheiden |
-| `NUR_GELOESCHTE_REFERENZEN` | nur noch in gelöschten Datensätzen/Seiten (Papierkorb) | löschbar, wenn der Papierkorb nicht mehr gebraucht wird |
-| `UNBENUTZT` | keine Fundstelle | Löschkandidat |
+| `IN_VERWENDUNG` | Einbindung in einem sichtbaren Datensatz auf einer sichtbaren Seite einer Site, oder Pfad in Code/TypoScript | behalten |
+| `VERSTECKT_VERWENDET` | nur in versteckten/zeitgesteuerten Datensätzen, versteckten Seiten, Workspaces, Ordnern („Datensatz einfügen“) oder Seiten ohne Site | behalten |
+| `IM_PAPIERKORB` | nur noch in gelöschten Datensätzen/Seiten (wiederherstellbar) | behalten |
+| `ABGERUFEN_OHNE_REFERENZ` | keine Referenz in TYPO3, aber Abrufe im Access-Log (externe Links, alte Seiten) | behalten – Links sollen funktionieren |
+| `PRUEFEN` | nur Bot-Abrufe (Suchmaschinen-Index), Fundstelle ohne Datensatz oder der ganze Ordner ist referenziert | manuell entscheiden |
+| `UNBENUTZT` | keine Fundstelle (oder nur verwaiste Referenzen auf nicht mehr existierende Datensätze) und keine Abrufe | Löschkandidat |
 
 Zusätzlich wird markiert, wenn eine **verwendete Datei auf der Platte fehlt** (kaputtes Bild auf der Website)
 oder eine Datei **nicht indiziert** ist.
@@ -135,6 +145,17 @@ sudo -u www-data php /opt/typo3Tools/bin/migrated-quarantine.php --root=/var/www
 
 Einzelne Zeilen in der Liste können vorher gelöscht werden, um Dateien auszunehmen.
 
+### Während der Quarantäne: Log beobachten
+
+Damit kein Link dauerhaft kaputtgeht, regelmäßig (z. B. täglich per Cron) prüfen, ob eine verschobene Datei
+aufgerufen wurde. Mit `--execute` werden genau diese Dateien automatisch zurückgeholt:
+
+```bash
+sudo -u www-data php /opt/typo3Tools/bin/migrated-quarantine.php --root=/var/www/typo3 --requested=/var/typo3-quarantaene/<lauf>/manifest.csv --access-log='/var/log/apache2/*access.log*' --execute
+```
+
+Bot-Abrufe zählen dabei nicht (mit `--include-bots` schon).
+
 ## Schritt 4: Endgültig bereinigen (nach der Frist, z. B. 4–8 Wochen)
 
 1. Datenbank-Backup erstellen.
@@ -158,10 +179,12 @@ bash tests/run.sh
 
 ## Grenzen
 
-- „Von wem“: TYPO3 speichert keinen Uploader in `sys_file`. Ersteller/Bearbeiter kommen aus `sys_history` und
-  `sys_log` des einbindenden Datensatzes – sind diese Tabellen bereinigt worden (Scheduler-Task), bleibt das Feld leer.
-  Für die migrierten Altdaten ist die Historie oft nicht mehr vorhanden.
+- Die Domain wird über die Site-Konfiguration bestimmt. Seiten außerhalb eines Site-Baums erscheinen als „(keine Site)“.
+- Redakteure: `verwendungen.csv` enthält Ersteller/Bearbeiter aus `sys_history`/`sys_log`, bei gekürzter Historie bleiben die Felder leer.
 - Dateien, die nur über externe Links aufgerufen werden, erkennt nur die Access-Log-Auswertung – und nur für den
-  Zeitraum, den die Logs abdecken (Logrotation, oft 14 Tage). Für eine belastbare Aussage Logs mehrere Wochen sammeln.
+  Zeitraum, den die Logs abdecken (Logrotation, oft 14 Tage). Deshalb: Logs länger aufbewahren
+  (`/etc/logrotate.d/apache2`, z. B. `rotate 180`) und während der Quarantäne mit `--requested` beobachten.
+- Die Domain eines Log-Abrufs ist nur bekannt, wenn das Log sie enthält (`vhost_combined` bzw. eigene Logdatei je
+  vHost) oder der Referer von einer eigenen Domain kommt.
 - Pfade, die zur Laufzeit zusammengesetzt werden (z. B. in PHP-Code oder per TypoScript-`stdWrap`), werden nicht erkannt.
 - Nur MySQL/MariaDB.

@@ -76,3 +76,13 @@ INSERT INTO sys_history (tstamp, actiontype, userid, recuid, tablename) VALUES
  (1500000000, 1, 2, 100, 'tt_content'), (1600000000, 2, 1, 100, 'tt_content'), (1500000100, 1, 2, 1000, 'sys_file_reference');
 INSERT INTO sys_log (tstamp, userid, type, action, tablename, recuid, details, log_data) VALUES
  (1650000000, 1, 2, 3, '', 0, 'File "%s" deleted', '["\\/_migrated\\/pics\\/versteckt.jpg"]');
+
+-- Ergänzungen: Übersetzung auf eigener Domain, verwaiste Referenz
+INSERT INTO pages (uid, pid, title, slug, sys_language_uid, l10n_parent) VALUES (12, 10, 'Products', '/products', 1, 11);
+INSERT INTO tt_content (uid, pid, header, CType, bodytext, sys_language_uid, crdate, tstamp) VALUES (107, 11, 'English', 'textmedia', '', 1, 1300000000, 1600000000);
+INSERT INTO sys_file (uid, storage, identifier, name, size, sha1) VALUES
+ (12, 1, '/_migrated/media/englisch.jpg', 'englisch.jpg', 5, ''),
+ (13, 1, '/_migrated/media/verwaist.pdf', 'verwaist.pdf', 5, '');
+INSERT INTO sys_file_reference (uid, pid, uid_local, uid_foreign, tablenames, fieldname) VALUES
+ (1008, 11, 12, 107, 'tt_content', 'assets'),
+ (1009, 11, 13, 999, 'tt_content', 'media');
