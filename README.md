@@ -77,6 +77,8 @@ Wichtige Optionen (vollständig mit `--help`):
 
 1. **Dateisystem** – alle Dateien in den gewählten `_migrated`-Ordnern (Größe, Änderungsdatum)
 2. **`sys_file`** – ist die Datei im FAL indiziert? Gibt es eine identische Kopie (SHA1) an anderer Stelle?
+   Jede Kopie wird auf der Platte geprüft (Existenz + SHA1 nachgerechnet); veraltete Index-Einträge werden
+   separat gemeldet und nicht als Duplikat gezählt.
 3. **`sys_file_reference`** – Einbindungen in Bild-/Medien-/Dateifeldern (`tt_content`, `pages`, News, …)
 4. **`sys_refindex`** – Links aus RTE und Link-Feldern (`t3://file?uid=…`)
 5. **Volltextsuche** in allen Text-Spalten der DB nach `_migrated/…`, `t3://file?uid=`, `<link file:…>` –

@@ -171,6 +171,10 @@ final class MigratedAnalyzer
     private array $folderHits = [];
     /** @var array<string, array> Verweise auf nicht vorhandene _migrated-Dateien */
     private array $brokenRefs = [];
+    /** @var array<int, array{name:string, base:?string}> sys_file_storage.uid => Name, lokaler Basispfad (null = nicht prüfbar) */
+    private array $storages = [];
+    /** @var string[] sys_file-Einträge, deren Datei fehlt oder deren Inhalt sich geändert hat */
+    private array $staleIndex = [];
     /** @var array<string, int> Log-Anfragen auf nicht vorhandene _migrated-Dateien */
     private array $logMissing = [];
     /** @var string[] */
@@ -403,33 +407,81 @@ final class MigratedAnalyzer
             }
         }
         unset($entry);
-        // Duplikate innerhalb von _migrated
+        // Duplikate innerhalb von _migrated (nur Dateien, die wirklich auf der Platte liegen)
         foreach ($bySha as $keys) {
-            if (count($keys) > 1) {
-                foreach ($keys as $key) {
-                    foreach ($keys as $other) {
-                        if ($other !== $key) {
-                            $this->files[$key]['duplicates'][] = 'fileadmin' . $other;
-                        }
+            $keys = array_values(array_filter($keys, fn ($k) => $this->files[$k]['on_disk']));
+            foreach ($keys as $key) {
+                foreach ($keys as $other) {
+                    if ($other !== $key) {
+                        $this->files[$key]['duplicates'][] = 'fileadmin' . $other;
                     }
                 }
             }
         }
-        // Duplikate außerhalb von _migrated (alle Storages)
+        // Duplikate außerhalb von _migrated (alle Storages) – sys_file kann veraltet sein,
+        // daher wird jede Fundstelle auf der Platte geprüft und der SHA1 nachgerechnet
+        $this->loadStorages();
         $missingCond = $this->db->has('sys_file', 'missing') ? 'AND missing = 0' : '';
         foreach (array_chunk(array_keys($bySha), 500) as $chunk) {
             $rows = $this->db->all(
-                'SELECT storage, identifier, sha1 FROM sys_file WHERE sha1 IN (' . Db::placeholders($chunk) . ")
+                'SELECT uid, storage, identifier, sha1 FROM sys_file WHERE sha1 IN (' . Db::placeholders($chunk) . ")
                  AND NOT (storage = ? AND identifier LIKE ?) $missingCond",
                 [...$chunk, $this->storage, '/\_migrated/%']
             );
             foreach ($rows as $row) {
-                $label = ((int)$row['storage'] === $this->storage ? 'fileadmin' : $row['storage'] . ':') . $row['identifier'];
+                $storage = $this->storages[(int)$row['storage']] ?? ['name' => 'Storage ' . $row['storage'], 'base' => null];
+                if ($storage['base'] === null) {
+                    $label = $storage['name'] . ' (uid ' . $row['storage'] . '): ' . $row['identifier'] . ' (nicht prüfbar)';
+                } else {
+                    $path = $storage['base'] . $row['identifier'];
+                    $index = 'sys_file uid ' . $row['uid'] . ': ' . $this->displayPath($path);
+                    if (!is_file($path)) {
+                        $this->staleIndex[] = $index . ' – Datei existiert nicht';
+                        continue;
+                    }
+                    if (filesize($path) < 200 * 1024 * 1024 && sha1_file($path) !== $row['sha1']) {
+                        $this->staleIndex[] = $index . ' – Inhalt hat sich geändert';
+                        continue;
+                    }
+                    $label = $this->displayPath($path);
+                }
                 foreach ($bySha[$row['sha1']] as $key) {
-                    $this->files[$key]['duplicates'][] = $label;
+                    if ($this->files[$key]['on_disk']) {
+                        $this->files[$key]['duplicates'][] = $label;
+                    }
                 }
             }
         }
+        if ($this->staleIndex !== []) {
+            $this->warnings[] = count($this->staleIndex) . ' Einträge im Dateiindex (sys_file) zeigen auf fehlende oder geänderte Dateien. '
+                . 'Abhilfe: Scheduler-Task "Dateiindex aktualisieren" (File Abstraction Layer: Update storage index) ausführen.';
+        }
+    }
+
+    private function loadStorages(): void
+    {
+        if (!$this->db->tableExists('sys_file_storage')) {
+            return;
+        }
+        foreach ($this->db->all('SELECT * FROM sys_file_storage') as $row) {
+            $config = (string)($row['configuration'] ?? '');
+            $field = static fn (string $name): string => preg_match(
+                '~<field index="' . $name . '">\s*<value index="vDEF">([^<]*)</value>~', $config, $m) ? trim(html_entity_decode($m[1])) : '';
+            $base = null;
+            if (($row['driver'] ?? 'Local') === 'Local') {
+                $basePath = $field('basePath');
+                $base = $field('pathType') === 'absolute'
+                    ? rtrim($basePath, '/')
+                    : $this->env->publicDir . '/' . trim($basePath, '/');
+            }
+            $this->storages[(int)$row['uid']] = ['name' => (string)($row['name'] ?? ''), 'base' => $base];
+        }
+    }
+
+    /** Pfad relativ zum Web-Root anzeigen (z. B. fileadmin/...), sonst absolut */
+    private function displayPath(string $path): string
+    {
+        return str_starts_with($path, $this->env->publicDir . '/') ? substr($path, strlen($this->env->publicDir) + 1) : $path;
     }
 
     // ------------------------------------------------------------------
@@ -1334,6 +1386,12 @@ final class MigratedAnalyzer
                 . " (Ausnahme: " . implode(', ', self::FOLDER_INFO_TABLES) . ").\n\n";
             $lines = array_unique(array_map(static fn ($h) => '`' . $h['folder'] . '` ← ' . $h['source'] . ': ' . $h['location'], $this->folderHits));
             $md .= $this->mdList(array_values($lines), 50);
+        }
+        if ($this->staleIndex !== []) {
+            $md .= "\n## Veraltete Einträge im Dateiindex (keine echten Duplikate)\n\n"
+                . "Diese sys_file-Einträge haben denselben SHA1 wie eine _migrated-Datei, die Datei existiert aber nicht (mehr) "
+                . "bzw. hat einen anderen Inhalt – typisch nach Löschen/Umbenennen per FTP/Shell. Sie werden nicht als Duplikat gezählt.\n\n"
+                . $this->mdList($this->staleIndex, 50);
         }
         if ($this->brokenRefs !== []) {
             $md .= "\n## Verweise auf nicht vorhandene _migrated-Dateien\n\n";

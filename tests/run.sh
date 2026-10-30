@@ -49,6 +49,7 @@ for f in pics/aktiv.jpg pics/versteckt.jpg pics/geloeschte_seite.jpg content_upl
   echo "inhalt $f" > "$F/$f"
 done
 printf 'unbenutzt-inhalt\n' > "$F/content_uploads/unbenutzt.pdf"
+printf 'unbenutzt-inhalt\n' > "$P/public/fileadmin/user_upload/kopie.pdf"
 
 LOG="$WORK/access.log"
 cat > "$LOG" <<'LOG'
@@ -101,6 +102,8 @@ check "Bearbeiter erkannt" verwendungen.csv 'redakteur'
 grep -q 'gibtsnicht.pdf' "$OUT/zusammenfassung.md" && echo "OK    defekter Verweis erkannt" || { echo "FEHLER defekter Verweis"; FAIL=1; }
 grep -q '_migrated/pics/logo` ' "$OUT/zusammenfassung.md" && { echo "FEHLER Teiltreffer als defekt gemeldet"; FAIL=1; } || echo "OK    keine Teiltreffer"
 grep -q 'user_upload/kopie.pdf' "$OUT/dateien.csv" && echo "OK    Duplikat erkannt" || { echo "FEHLER Duplikat"; FAIL=1; }
+grep 'pics/aktiv.jpg' "$OUT/dateien.csv" | grep -q 'Netzfunke' && { echo "FEHLER veralteter Index als Duplikat gemeldet"; FAIL=1; } || echo "OK    veralteter Index ist kein Duplikat"
+check "veralteter Index gemeldet" zusammenfassung.md 'fileadmin/Netzfunke/_migrated/pics/aktiv.jpg – Datei existiert nicht'
 
 # Quarantäne: Probelauf, Ausführen, Wiederherstellen
 Q="$WORK/quarantaene"

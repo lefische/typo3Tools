@@ -86,3 +86,7 @@ INSERT INTO sys_file (uid, storage, identifier, name, size, sha1) VALUES
 INSERT INTO sys_file_reference (uid, pid, uid_local, uid_foreign, tablenames, fieldname) VALUES
  (1008, 11, 12, 107, 'tt_content', 'assets'),
  (1009, 11, 13, 999, 'tt_content', 'media');
+
+-- Veralteter Index-Eintrag: Kopie von aktiv.jpg, auf der Platte längst gelöscht
+INSERT INTO sys_file (uid, storage, identifier, name, size, sha1) VALUES
+ (14, 1, '/Netzfunke/_migrated/pics/aktiv.jpg', 'aktiv.jpg', 5, SHA1('inhalt pics/aktiv.jpg\n'));
